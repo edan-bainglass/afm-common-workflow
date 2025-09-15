@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import typing as t
 from enum import Enum
 from pathlib import Path
 
@@ -5,7 +8,8 @@ from aiida import orm
 from aiida_quantumespresso.calculations.pp import PpCalculation
 from aiida_quantumespresso.workflows.pw.base import PwBaseWorkChain
 from aiida_quantumespresso.workflows.pw.relax import PwRelaxWorkChain
-from aiida_workgraph import shelljob, task
+from aiida_workgraph import dynamic, namespace, shelljob, task
+from ase import Atoms
 
 
 class AfmCase(Enum):
@@ -14,10 +18,27 @@ class AfmCase(Enum):
     HARTREE_RHO = "hartree_rho"
 
 
-def write_params(params: dict, filepath: Path):
-    with open(filepath, "w") as config_file:
+@task
+def write_afm_params(params: dict) -> orm.SinglefileData:
+    afm_filepath = Path.cwd() / "params.ini"
+    with open(afm_filepath, "w") as config_file:
         for key, value in params.items():
+            if isinstance(value, (list, tuple)):
+                value = " ".join(map(str, value))
             config_file.write(f"{key} {value}\n")
+    return orm.SinglefileData(file=afm_filepath.as_posix())
+
+
+@task
+def write_structure_file(structure: Atoms) -> orm.SinglefileData:
+    geom_filepath = Path.cwd() / "geo.xyz"
+    structure.write(geom_filepath, format="xyz")
+    return orm.SinglefileData(file=geom_filepath.as_posix())
+
+
+RelaxationJob = task(PwRelaxWorkChain)
+ScfJob = task(PwBaseWorkChain)
+PpJob = task(PpCalculation)
 
 
 @task.graph
@@ -26,174 +47,243 @@ def AfmWorkflow(
     structure: orm.StructureData,
     afm_params: dict,
     relax: bool = False,
-    pw_params: dict = None,
-    pp_hartree_params: dict = None,
-    pp_rho_params: dict = None,
+    dft_params: t.Annotated[
+        dict,
+        RelaxationJob.inputs,
+    ] = None,
+    pp_params: t.Annotated[
+        dict,
+        namespace(
+            hartree=PpJob.inputs,
+            charge=namespace(
+                structure=PpJob.inputs,
+                tip=PpJob.inputs,
+            ),
+        ),
+    ] = None,
     tip: orm.StructureData = None,
-):
-    pw_task = None
+) -> t.Annotated[dict, dynamic(t.Any)]:
+    """AFM simulation workflow."""
+
+    dft_task = None
     hartree_task = None
     rho_task = None
     tip_rho_task = None
 
     if relax:
-        assert pw_params
-        pw_task = task(PwRelaxWorkChain)(
+        assert dft_params, "Missing DFT parameters"
+        dft_task = RelaxationJob(
             structure=structure,
-            **pw_params,
+            **dft_params,
         )
-        structure = pw_task.output_structure
+        structure = dft_task.output_structure
+
+    assert structure, "Missing structure"
+    geometry_file = write_structure_file(structure=structure).result
+
+    assert afm_params, "Missing AFM parameters"
+    afm_params_file = write_afm_params(params=afm_params).result
+
+    ljff = shelljob(
+        command="ppafm-generate-ljff",
+        nodes={
+            "geometry": geometry_file,
+            "parameters": afm_params_file,
+        },
+        arguments=[
+            "-i",
+            "geo.xyz",
+            "-f",
+            "npy",
+        ],
+        outputs=["FFLJ.npz"],
+    )
+
+    scan_nodes = {
+        "parameters": afm_params_file,
+        "ljff_data": ljff.FFLJ_npz,
+    }
+
+    metadata = {
+        "options": {
+            "use_symlinks": True,
+        }
+    }
 
     if case != AfmCase.EMPIRICAL:
         if not relax:
-            pw_task = task(PwBaseWorkChain)(
-                structure=structure,
-                **pw_params,
-            )
+            assert dft_params, "Missing DFT parameters"
+            scf_params = dft_params.get("base", {})
+            assert scf_params, "Missing base SCF parameters"
+            scf_params["pw.structure"] = structure
+            dft_task = ScfJob(**scf_params)
 
-        hartree_task = task(PpCalculation)(
-            structure=structure,
-            parent_folder=pw_task.remote_folder,
-            **pp_hartree_params,
+        assert pp_params, "Missing post-processing parameters"
+        hartree_params = pp_params.get("hartree", {})
+        assert hartree_params, "Missing Hartree parameters"
+        hartree_task = PpJob(
+            parent_folder=dft_task.remote_folder,
+            **hartree_params,
         )
 
-        if case == AfmCase.HARTREE_RHO:
-            rho_task = task(PpCalculation)(
-                structure=structure,
-                parent_folder=pw_task.remote_folder,
-                **pp_rho_params,
+        if case == AfmCase.HARTREE.name:
+            elff = shelljob(
+                command="ppafm-generate-elff",
+                metadata=metadata,
+                nodes={
+                    "parameters": afm_params_file,
+                    "ljff_data": ljff.FFLJ_npz,
+                    "hartree_data": hartree_task.remote_folder,
+                },
+                filenames={
+                    "hartree_data": "hartree",
+                },
+                arguments=[
+                    "-i",
+                    "hartree/aiida.fileout",
+                    "-F",
+                    "cube",
+                    "-f",
+                    "npy",
+                ],
+                outputs=["FFel.npz"],
             )
-            tip_rho_task = task(PpCalculation)(
+
+            scan_nodes["elff_data"] = elff.FFel_npz
+
+        # Experimental feature, not fully tested
+        elif case == AfmCase.HARTREE_RHO:
+            charge_namespace: dict = pp_params.get("charge", {})
+            geom_charge_params = charge_namespace.get("structure", {})
+            assert geom_charge_params, "Missing structure charge density parameters"
+            rho_task = PpJob(
+                structure=structure,
+                parent_folder=dft_task.remote_folder,
+                **geom_charge_params,
+            )
+
+            # write tip file
+
+            tip_charge_params = charge_namespace.get("tip", {})
+            assert tip, "Missing tip structure"
+            assert tip_charge_params, "Missing tip charge density parameters"
+            tip_rho_task = PpJob(
                 structure=tip,
-                parent_folder=pw_task.remote_folder,
-                **pp_rho_params,
+                parent_folder=dft_task.remote_folder,
+                **tip_charge_params,
             )
 
-    geom_filepath = Path.cwd() / "geo.xyz"
-    structure.get_ase().write(geom_filepath, format="xyz")
-    geometry_file = orm.SinglefileData(file=geom_filepath.as_posix())
+            conv_rho = shelljob(
+                command="ppafm-conv-rho",
+                nodes={
+                    "geom_density": rho_task.remote_folder,
+                    "tip_density": tip_rho_task.remote_folder,
+                },
+                filenames={
+                    "geom_density": "structure",
+                    "tip_density": "tip",
+                },
+                arguments=[
+                    "-s",
+                    "structure/charge.cube",
+                    "-t",
+                    "tip/charge.cube",
+                    "-B",
+                    "1.0",
+                    "-E",
+                ],
+                outputs=["charge.cube"],
+            )
 
-    afm_filepath = Path.cwd() / "params.ini"
-    write_params(afm_params, afm_filepath)
-    afm_params_file = orm.SinglefileData(file=afm_filepath.as_posix())
+            charge_elff = shelljob(
+                command="ppafm-generate-elff",
+                nodes={
+                    "hartree_data": hartree_task.remote_folder,
+                    "conv_density": conv_rho.charge_cube,
+                    "tip_density": tip_rho_task.remote_folder,
+                },
+                filenames={
+                    "hartree_data": "hartree",
+                    "tip_density": "tip",
+                },
+                arguments=[
+                    "-i",
+                    "hartree/hartree.cube",
+                    "-tip-dens",
+                    "tip/charge.cube",
+                    "--Rcode",
+                    "0.7",
+                    "-E",
+                    "--doDensity",
+                ],
+                outputs=["FFel.npz"],
+            )
 
-    if case == AfmCase.EMPIRICAL:
-        ljff = shelljob(
-            command="ppafm-generate-ljff",
-            arguments=["-i geo.xyz", "-f npy"],
-            nodes={
-                "geometry": geometry_file,
-                "parameters": afm_params_file,
-            },
-        )
-        scan = shelljob(
-            command="ppafm-relaxed-scan",
-            arguments=["-f npy"],
-            nodes={
-                "parameters": afm_params_file,
-                "ljff_data": ljff.remote_folder,
-            },
-        )
-        results = shelljob(
-            command="ppafm-plot-results",
-            arguments=["--df", "--cbar", "--save_df", "-f npy"],
-            nodes={
-                "parameters": afm_params_file,
-                "scan_data": scan.remote_folder,
-            },
-        )
+            dftd3 = shelljob(
+                command="ppafm-generate-dftd3",
+                nodes={
+                    "hartree_data": hartree_task.remote_folder,
+                },
+                filenames={
+                    "hartree_data": "hartree",
+                },
+                arguments=[
+                    "-i",
+                    "hartree/hartree.cube",
+                    "--df_name",
+                    "PBE",
+                ],
+                outputs=["dftd3.dat"],
+            )
 
-    elif case == AfmCase.HARTREE:
-        ljff = shelljob(
-            command="ppafm-generate-ljff",
-            nodes={
-                "input": geometry_file,
-            },
-            arguments=["-i geo.xyz", "-f npy"],
-        )
-        elff = shelljob(
-            command="ppafm-generate-elff",
-            nodes={
-                "hartree_data": hartree_task.remote_folder,
-            },
-            arguments=["-i hartree.cube", "-f npy"],
-        )
-        scan = shelljob(
-            command="ppafm-relaxed-scan",
-            nodes={
-                "ljff_data": ljff.remote_folder,
-                "elff_data": elff.remote_folder,
-            },
-            arguments=["-f npy"],
-        )
-        results = shelljob(
-            command="ppafm-plot-results",
-            nodes={
-                "scan_data": scan.remote_folder,
-            },
-            arguments=["--df", "--cbar", "--save_df", "-f npy"],
-        )
-    elif case == AfmCase.HARTREE_RHO:
-        conv_rho = shelljob(
-            command="ppafm-conv-rho",
-            nodes={
-                "geom_density": rho_task.remote_folder,
-                "tip_density": tip_rho_task.remote_folder,
-            },
-            arguments=[
-                "-s charge.xsf",
-                "-t density_CO.xsf",
-                "-B 1.0",
-                "-E",
-            ],
-        )
-        charge_elff = shelljob(
-            command="ppafm-generate-elff",
-            nodes={
-                "hartree_data": hartree_task.remote_folder,
-                "tip_density": tip_rho_task.remote_folder,
-            },
-            arguments=[
-                "-i LOCPOT.xsf",
-                "-tip-dens density_CO.xsf",
-                "--Rcode 0.7",
-                "-E",
-                "--doDensity",
-            ],
-        )
-        dftd3 = shelljob(
-            command="ppafm-generate-dftd3",
-            nodes={
-                "hartree_data": hartree_task.remote_folder,
-            },
-            arguments=["-i LOCPOT.xsf", "--df_name PBE"],
-        )
-        ljff = shelljob(
-            command="ppafm-generate-ljff",
-            nodes={
-                "input": geometry_file,
-            },
-            arguments=["-i geo.xyz", "-f npy"],
-        )
-        elff = shelljob(
-            command="ppafm-generate-elff",
-            nodes={
-                "hartree_data": hartree_task.remote_folder,
-            },
-            arguments=["-i hartree.cube", "-f npy"],
-        )
-        scan = shelljob(
-            command="ppafm-relaxed-scan",
-            nodes={
-                "ljff_data": ljff.remote_folder,
-                "elff_data": elff.remote_folder,
-            },
-            arguments=["-f npy"],
-        )
-        results = shelljob(
-            command="ppafm-plot-results",
-            nodes={
-                "scan_data": scan.remote_folder,
-            },
-            arguments=["--df", "--cbar", "--save_df", "-f npy"],
-        )
+            elff = shelljob(
+                command="ppafm-generate-elff",
+                nodes={
+                    "hartree_data": hartree_task.remote_folder,
+                    "charge_elff_data": charge_elff.FFel_npz,
+                    "dftd3_data": dftd3.dftd3_dat,
+                },
+                arguments=[
+                    "-i",
+                    "hartree/hartree.cube",
+                    "-f",
+                    "npy",
+                ],
+                outputs=["FFel.npz"],
+            )
+
+        else:
+            raise ValueError(f"Unsupported case: {case}")
+
+    scan = shelljob(
+        command="ppafm-relaxed-scan",
+        metadata=metadata,
+        nodes=scan_nodes,
+        arguments=[
+            "-f",
+            "npy",
+        ],
+        outputs=["Q0.00K0.35"],
+    )
+
+    results = shelljob(
+        command="ppafm-plot-results",
+        metadata=metadata,
+        nodes={
+            "parameters": afm_params_file,
+            "scan_dir": scan.Q0_00K0_35,
+        },
+        filenames={
+            "scan_dir": "Q0.00K0.35",
+        },
+        arguments=[
+            "--df",
+            "--cbar",
+            "--save_df",
+            "-f",
+            "npy",
+        ],
+        outputs=["Q0.00K0.35"],
+    )
+
+    return results
