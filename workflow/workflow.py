@@ -30,13 +30,13 @@ def write_afm_params(params: dict) -> orm.SinglefileData:
 
 
 @task
-def write_structure_file(structure: Atoms) -> orm.SinglefileData:
-    geom_filepath = Path.cwd() / "geo.xyz"
+def write_structure_file(structure: Atoms, filename: str) -> orm.SinglefileData:
+    geom_filepath = Path.cwd() / filename
     structure.write(geom_filepath, format="xyz")
     return orm.SinglefileData(file=geom_filepath.as_posix())
 
 
-RelaxationJob = task(PwRelaxWorkChain)
+RelaxJob = task(PwRelaxWorkChain)
 ScfJob = task(PwBaseWorkChain)
 PpJob = task(PpCalculation)
 
@@ -48,38 +48,35 @@ def AfmWorkflow(
     afm_params: dict,
     relax: bool = False,
     dft_params: t.Annotated[
-        dict,
-        RelaxationJob.inputs,
+        dict[str, dict],
+        namespace(
+            structure=RelaxJob.inputs,
+            tip=ScfJob.inputs,
+        ),
     ] = None,
     pp_params: t.Annotated[
-        dict,
+        dict[str, dict],
         namespace(
             hartree=PpJob.inputs,
-            charge=namespace(
-                structure=PpJob.inputs,
-                tip=PpJob.inputs,
-            ),
+            charge=PpJob.inputs,
         ),
     ] = None,
     tip: orm.StructureData = None,
 ) -> t.Annotated[dict, dynamic(t.Any)]:
     """AFM simulation workflow."""
 
-    dft_task = None
-    hartree_task = None
-    rho_task = None
-    tip_rho_task = None
-
     if relax:
         assert dft_params, "Missing DFT parameters"
-        dft_task = RelaxationJob(
+        geom_dft_params = dft_params.get("structure", {})
+        dft_job = RelaxJob(
             structure=structure,
-            **dft_params,
+            **geom_dft_params,
         )
-        structure = dft_task.output_structure
+        structure = dft_job.output_structure
+    else:
+        assert structure, "Missing structure"
 
-    assert structure, "Missing structure"
-    geometry_file = write_structure_file(structure=structure).result
+    geometry_file = write_structure_file(structure, "geo.xyz").result
 
     assert afm_params, "Missing AFM parameters"
     afm_params_file = write_afm_params(params=afm_params).result
@@ -110,19 +107,21 @@ def AfmWorkflow(
         }
     }
 
-    if case != AfmCase.EMPIRICAL:
+    if case != AfmCase.EMPIRICAL.name:
         if not relax:
             assert dft_params, "Missing DFT parameters"
-            scf_params = dft_params.get("base", {})
-            assert scf_params, "Missing base SCF parameters"
+            geom_dft_params = dft_params.get("structure", {})
+            scf_params = geom_dft_params.get("base", {})
+            assert scf_params, "Missing structure base SCF parameters"
             scf_params["pw.structure"] = structure
-            dft_task = ScfJob(**scf_params)
+            scf_params["pw"]["parameters"]["CONTROL"]["calculation"] = "scf"
+            dft_job = ScfJob(**scf_params)
 
         assert pp_params, "Missing post-processing parameters"
         hartree_params = pp_params.get("hartree", {})
         assert hartree_params, "Missing Hartree parameters"
         hartree_task = PpJob(
-            parent_folder=dft_task.remote_folder,
+            parent_folder=dft_job.remote_folder,
             **hartree_params,
         )
 
@@ -151,33 +150,31 @@ def AfmWorkflow(
 
             scan_nodes["elff_data"] = elff.FFel_npz
 
-        # Experimental feature, not fully tested
-        elif case == AfmCase.HARTREE_RHO:
-            charge_namespace: dict = pp_params.get("charge", {})
-            geom_charge_params = charge_namespace.get("structure", {})
-            assert geom_charge_params, "Missing structure charge density parameters"
-            rho_task = PpJob(
-                structure=structure,
-                parent_folder=dft_task.remote_folder,
-                **geom_charge_params,
+        # TODO experimental feature - not fully tested - needs further attention
+        elif case == AfmCase.HARTREE_RHO.name:
+            charge_params = pp_params.get("charge", {})
+            assert charge_params, "Missing charge density parameters"
+            rho_job = PpJob(
+                parent_folder=dft_job.remote_folder,
+                **charge_params,
             )
 
-            # write tip file
-
-            tip_charge_params = charge_namespace.get("tip", {})
             assert tip, "Missing tip structure"
-            assert tip_charge_params, "Missing tip charge density parameters"
-            tip_rho_task = PpJob(
-                structure=tip,
-                parent_folder=dft_task.remote_folder,
-                **tip_charge_params,
+            tip_scf_params = dft_params.get("tip", {})
+            assert tip_scf_params, "Missing tip DFT parameters"
+            tip_scf_params["pw.structure"] = tip
+            tip_dft_job = ScfJob(**tip_scf_params)
+
+            tip_rho_job = PpJob(
+                parent_folder=tip_dft_job.remote_folder,
+                **charge_params,
             )
 
             conv_rho = shelljob(
                 command="ppafm-conv-rho",
                 nodes={
-                    "geom_density": rho_task.remote_folder,
-                    "tip_density": tip_rho_task.remote_folder,
+                    "geom_density": rho_job.remote_folder,
+                    "tip_density": tip_rho_job.remote_folder,
                 },
                 filenames={
                     "geom_density": "structure",
@@ -185,32 +182,32 @@ def AfmWorkflow(
                 },
                 arguments=[
                     "-s",
-                    "structure/charge.cube",
+                    "structure/aiida.fileout",
                     "-t",
-                    "tip/charge.cube",
+                    "tip/aiida.fileout",
                     "-B",
                     "1.0",
                     "-E",
                 ],
-                outputs=["charge.cube"],
             )
 
             charge_elff = shelljob(
                 command="ppafm-generate-elff",
                 nodes={
+                    "conv_rho_data": conv_rho.remote_folder,
                     "hartree_data": hartree_task.remote_folder,
-                    "conv_density": conv_rho.charge_cube,
-                    "tip_density": tip_rho_task.remote_folder,
+                    "tip_density": tip_rho_job.remote_folder,
                 },
                 filenames={
+                    "conv_rho_data": "conv_rho",
                     "hartree_data": "hartree",
                     "tip_density": "tip",
                 },
                 arguments=[
                     "-i",
-                    "hartree/hartree.cube",
+                    "hartree/aiida.fileout",
                     "-tip-dens",
-                    "tip/charge.cube",
+                    "tip/aiida.fileout",
                     "--Rcode",
                     "0.7",
                     "-E",
@@ -229,11 +226,10 @@ def AfmWorkflow(
                 },
                 arguments=[
                     "-i",
-                    "hartree/hartree.cube",
+                    "hartree/aiida.fileout",
                     "--df_name",
                     "PBE",
                 ],
-                outputs=["dftd3.dat"],
             )
 
             elff = shelljob(
@@ -241,11 +237,13 @@ def AfmWorkflow(
                 nodes={
                     "hartree_data": hartree_task.remote_folder,
                     "charge_elff_data": charge_elff.FFel_npz,
-                    "dftd3_data": dftd3.dftd3_dat,
+                },
+                filenames={
+                    "hartree_data": "hartree",
                 },
                 arguments=[
                     "-i",
-                    "hartree/hartree.cube",
+                    "hartree/aiida.fileout",
                     "-f",
                     "npy",
                 ],
