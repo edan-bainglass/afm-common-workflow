@@ -8,7 +8,7 @@ from aiida import orm
 from aiida_quantumespresso.calculations.pp import PpCalculation
 from aiida_quantumespresso.workflows.pw.base import PwBaseWorkChain
 from aiida_quantumespresso.workflows.pw.relax import PwRelaxWorkChain
-from aiida_workgraph import dynamic, namespace, shelljob, task
+from aiida_workgraph import dynamic, namespace, select, shelljob, task
 from ase import Atoms
 
 
@@ -50,15 +50,31 @@ def AfmWorkflow(
     dft_params: t.Annotated[
         dict[str, dict],
         namespace(
-            structure=RelaxJob.inputs,
-            tip=ScfJob.inputs,
+            geom=t.Annotated[
+                dict,
+                RelaxJob.inputs,
+                select(exclude=["structure"]),
+            ],
+            tip=t.Annotated[
+                dict,
+                ScfJob.inputs,
+                select(exclude=["pw.structure"]),
+            ],
         ),
     ] = None,
     pp_params: t.Annotated[
         dict[str, dict],
         namespace(
-            hartree=PpJob.inputs,
-            charge=PpJob.inputs,
+            hartree=t.Annotated[
+                dict,
+                PpJob.inputs,
+                select(exclude=["parent_folder"]),
+            ],
+            charge=t.Annotated[
+                dict,
+                PpJob.inputs,
+                select(exclude=["parent_folder"]),
+            ],
         ),
     ] = None,
     tip: orm.StructureData = None,
@@ -67,7 +83,7 @@ def AfmWorkflow(
 
     if relax:
         assert dft_params, "Missing DFT parameters"
-        geom_dft_params = dft_params.get("structure", {})
+        geom_dft_params = dft_params.get("geom", {})
         dft_job = RelaxJob(
             structure=structure,
             **geom_dft_params,
@@ -110,9 +126,9 @@ def AfmWorkflow(
     if case != AfmCase.EMPIRICAL.name:
         if not relax:
             assert dft_params, "Missing DFT parameters"
-            geom_dft_params = dft_params.get("structure", {})
+            geom_dft_params = dft_params.get("geom", {})
             scf_params = geom_dft_params.get("base", {})
-            assert scf_params, "Missing structure base SCF parameters"
+            assert scf_params, "Missing geom base SCF parameters"
             scf_params["pw.structure"] = structure
             scf_params["pw"]["parameters"]["CONTROL"]["calculation"] = "scf"
             dft_job = ScfJob(**scf_params)
@@ -150,7 +166,7 @@ def AfmWorkflow(
 
             scan_nodes["elff_data"] = elff.FFel_npz
 
-        # TODO experimental feature - not fully tested - needs further attention
+        # Experimental feature, not fully tested
         elif case == AfmCase.HARTREE_RHO.name:
             charge_params = pp_params.get("charge", {})
             assert charge_params, "Missing charge density parameters"
